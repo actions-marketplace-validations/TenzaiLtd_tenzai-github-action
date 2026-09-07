@@ -17,6 +17,8 @@ type ActionInputs = {
   apiBaseUrl: string;
   appId: string;
   dryRun: boolean;
+  mode: 'trigger' | 'list';
+  orgId: string;
   saToken: string;
 };
 
@@ -53,6 +55,16 @@ function platformUrl(apiBaseUrl: string, path: string): string {
   return `${apiBaseUrl}/v1/${path}`;
 }
 
+// Appends `?org_id=` only when set. Omitting it entirely (rather than
+// sending an empty value) preserves the platform's own tenant-default
+// resolution for callers that don't need to disambiguate — org-id is an
+// opt-in disambiguator, not a newly-required input.
+function withOrgId(url: string, orgId: string): string {
+  if (!orgId) return url;
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}org_id=${encodeURIComponent(orgId)}`;
+}
+
 function authorizationHeaders(saToken: string): Record<string, string> {
   return {
     Authorization: `Bearer ${saToken}`,
@@ -64,9 +76,13 @@ async function validateApplication(
   saToken: string,
   appId: string,
   apiBaseUrl: string,
+  orgId: string,
 ): Promise<void> {
   await requestJson(
-    platformUrl(apiBaseUrl, `applications/${encodeURIComponent(appId)}`),
+    withOrgId(
+      platformUrl(apiBaseUrl, `applications/${encodeURIComponent(appId)}`),
+      orgId,
+    ),
     {
       method: 'GET',
       headers: authorizationHeaders(saToken),
@@ -121,9 +137,12 @@ async function triggerTest(
   core.startGroup('Trigger commit-diff test');
   try {
     const data = await requestJson(
-      platformUrl(
-        inputs.apiBaseUrl,
-        `applications/${encodeURIComponent(inputs.appId)}/tests`,
+      withOrgId(
+        platformUrl(
+          inputs.apiBaseUrl,
+          `applications/${encodeURIComponent(inputs.appId)}/tests`,
+        ),
+        inputs.orgId,
       ),
       {
         method: 'POST',
@@ -192,15 +211,134 @@ async function writeSummary(
   await core.summary.addRaw(lines.join('\n')).write();
 }
 
+type OrgSummary = { id: string; name: string; slug: string };
+
+async function fetchOwnOrg(
+  saToken: string,
+  apiBaseUrl: string,
+): Promise<OrgSummary> {
+  const data = await requestJson(
+    platformUrl(apiBaseUrl, 'organizations/mine'),
+    { method: 'GET', headers: authorizationHeaders(saToken) },
+    'Tenzai organization lookup failed',
+  );
+  if (!Array.isArray(data) || data.length !== 1) {
+    throw new Error(
+      `Expected exactly one organization for this service account, got ${
+        Array.isArray(data) ? data.length : 'a non-array response'
+      }.`,
+    );
+  }
+  return (data as OrgSummary[])[0]!;
+}
+
+type AppSummary = {
+  applicationType: string;
+  id: string;
+  name: string;
+  repository: string | null;
+};
+
+function appSummaryFromRaw(raw: unknown): AppSummary {
+  const app = raw as Record<string, unknown>;
+  const code = app.code as
+    { sources?: Array<{ repository?: string }> } | undefined;
+  return {
+    id: String(app.id),
+    name: String(app.name),
+    applicationType: String(
+      app.applicationType ?? app.application_type ?? 'UNKNOWN',
+    ),
+    repository: code?.sources?.find((s) => s?.repository)?.repository ?? null,
+  };
+}
+
+async function fetchAllApps(
+  saToken: string,
+  apiBaseUrl: string,
+  orgId: string,
+): Promise<AppSummary[]> {
+  const apps: AppSummary[] = [];
+  let page = 1;
+  const size = 100;
+  for (;;) {
+    const data = await requestJson(
+      platformUrl(
+        apiBaseUrl,
+        `applications?org_id=${encodeURIComponent(orgId)}&page=${page}&size=${size}`,
+      ),
+      { method: 'GET', headers: authorizationHeaders(saToken) },
+      'Tenzai application list failed',
+    );
+    if (
+      typeof data !== 'object' ||
+      data === null ||
+      !('items' in data) ||
+      !Array.isArray(data.items) ||
+      !('pages' in data) ||
+      !Number.isInteger(data.pages)
+    ) {
+      throw new Error(
+        'Tenzai application list response did not contain a valid items array and pages count.',
+      );
+    }
+    const pages = data.pages as number;
+    for (const raw of data.items) {
+      apps.push(appSummaryFromRaw(raw));
+    }
+    if (page >= pages) break;
+    page += 1;
+  }
+  return apps;
+}
+
+async function writeListSummary(
+  core: CoreApi,
+  org: OrgSummary,
+  apps: AppSummary[],
+): Promise<void> {
+  const lines = [
+    '### 🛡️ Tenzai — organization and applications',
+    '',
+    `**Organization:** ${org.name} (\`${org.id}\`)`,
+    '',
+  ];
+  if (apps.length === 0) {
+    lines.push('No applications found in this organization.');
+  } else {
+    lines.push(
+      '| App ID | Name | Type | Repository |',
+      '|---|---|---|---|',
+      ...apps.map(
+        (a) =>
+          `| \`${a.id}\` | ${a.name} | ${a.applicationType} | ${a.repository ?? '—'} |`,
+      ),
+    );
+  }
+  await core.summary.addRaw(lines.join('\n')).write();
+}
+
 function readInputs(core: CoreApi): ActionInputs {
   const saToken = core.getInput('access-key', { required: true });
   core.setSecret(saToken);
   const rawBaseUrl = core.getInput('base-url') || DEFAULT_API_URL;
+  const rawMode = core.getInput('mode') || 'trigger';
+  if (rawMode !== 'trigger' && rawMode !== 'list') {
+    throw new Error(
+      `Unrecognized mode "${rawMode}" — must be "trigger" or "list".`,
+    );
+  }
+  const appId = core.getInput('app-id');
+  if (rawMode === 'trigger' && !appId) {
+    throw new Error('app-id is required when mode is "trigger" (the default).');
+  }
   return {
     saToken,
     apiBaseUrl: rawBaseUrl.replace(/\/+$/, ''),
-    appId: core.getInput('app-id', { required: true }),
+    appId,
     dryRun: core.getBooleanInput('dry-run'),
+    mode: rawMode,
+    orgId: core.getInput('org-id'),
   };
 }
 
@@ -211,11 +349,26 @@ export async function run({
 }: RunDependencies): Promise<void> {
   try {
     const inputs = readInputs(core);
+    if (inputs.mode === 'list') {
+      const org = await fetchOwnOrg(inputs.saToken, inputs.apiBaseUrl);
+      const apps = await fetchAllApps(
+        inputs.saToken,
+        inputs.apiBaseUrl,
+        org.id,
+      );
+      await writeListSummary(core, org, apps);
+      core.notice(
+        `Found ${apps.length} application(s) in organization ${org.id}.`,
+      );
+      return;
+    }
+
     if (inputs.dryRun) {
       await validateApplication(
         inputs.saToken,
         inputs.appId,
         inputs.apiBaseUrl,
+        inputs.orgId,
       );
       core.notice(
         'dry-run: authentication and application access validated; no test triggered.',
